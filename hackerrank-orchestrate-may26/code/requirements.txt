@@ -1,0 +1,5 @@
+# The agent runs offline on the Python standard library alone — no install
+# needed to produce output.csv.
+#
+# Install this only to enable Claude-written responses (ANTHROPIC_API_KEY set):
+anthropic>=0.40
