@@ -85,6 +85,19 @@ _POLICY_RULES: list[tuple[str, str, re.Pattern]] = [
         r"remove (an?|this|the) (interviewer|user|employee)|"
         r"cancel (my|our) subscription|delete my account|"
         r"reschedul|certificate name|update .* certificate)")),
+    # Request for a new product capability (NOT a bug or a how-to). Conservative
+    # phrasing so user actions like "add extra time" are not misread as a
+    # feature request.
+    ("feature_request", "low", re.compile(
+        r"(feature request|feature suggestion|enhancement request|"
+        r"request (a|an|the)? ?(new )?feature|"
+        r"would be (great|nice|helpful|good) if|"
+        r"is (it|there) (any )?(possible|a way) to add (a|an|the)? ?"
+        r"(feature|option|ability|support)|"
+        r"please add (a|an|the)? ?(feature|option|ability|support for)|"
+        r"i wish (claude|hackerrank|visa|you|it|this) (had|could|supported)|"
+        r"do you (plan to|have plans to) (add|support)|"
+        r"can you (add|build|introduce) (a |an |the )?(feature|option|ability))")),
 ]
 
 
@@ -212,13 +225,13 @@ class ResolutionEngine:
         # match, so a substantive ticket that merely starts with "thanks" does
         # not trigger it; no coverage guard needed.
         if "pleasantry" in flags:
-            return self._fixed(RESPONSE_PLEASANTRY, "", "Replied", "invalid",
+            return self._fixed(RESPONSE_PLEASANTRY, "", "replied", "invalid",
                                "R1 pleasantry: message contains only thanks/greeting.",
                                confidence=0.95)
 
         # R2 — out of scope / malicious request
         if "out_of_scope" in flags:
-            return self._fixed(RESPONSE_OUT_OF_SCOPE, "", "Replied", "invalid",
+            return self._fixed(RESPONSE_OUT_OF_SCOPE, "", "replied", "invalid",
                                "R2 out_of_scope: request is unrelated to supported "
                                "products or asks for disallowed actions.",
                                confidence=0.9)
@@ -228,7 +241,7 @@ class ResolutionEngine:
         # so intent (not coverage) is the reliable discriminator. Vague-but-real
         # tickets ("it's not working") carry a problem signal and stay in scope.
         if not self._looks_like_support(fact):
-            return self._fixed(RESPONSE_OUT_OF_SCOPE, "", "Replied", "invalid",
+            return self._fixed(RESPONSE_OUT_OF_SCOPE, "", "replied", "invalid",
                                "R2 out_of_scope: no supported-product or problem "
                                "intent detected in the ticket.",
                                confidence=0.75)
@@ -237,7 +250,7 @@ class ResolutionEngine:
         if "outage" in flags:
             return self._fixed(RESPONSE_ESCALATE,
                                self._area(passages, default="platform"),
-                               "Escalated", "bug",
+                               "escalated", "bug",
                                "R3 outage: core functionality reported down; routed to "
                                "engineering on-call." + guard,
                                confidence=0.85)
@@ -248,7 +261,7 @@ class ResolutionEngine:
                 "Thank you for the responsible disclosure. I'm routing this to our "
                 "security team for review."), escalate=True)
             return self._answer(resp, self._area(passages, default="security"),
-                                "Escalated", "product_issue",
+                                "escalated", "product_issue",
                                 "R4 security_report: vulnerability/bug-bounty report "
                                 "escalated to the security team." + guard,
                                 confidence=0.8)
@@ -259,10 +272,24 @@ class ResolutionEngine:
                 "This needs a specialist to act on your account safely, so I'm "
                 "escalating it to a human agent."), escalate=True)
             return self._answer(resp, self._area(passages, default="account_support"),
-                                "Escalated", "product_issue",
+                                "escalated", "product_issue",
                                 "R5 sensitive_action: financial/identity/legal matter "
                                 "requires authenticated human handling." + guard,
                                 confidence=0.8)
+
+        # R5b — feature request: acknowledge and reply (not a bug, not invalid).
+        # We can't promise roadmap items, so we reply with grounded context if
+        # any exists and record it as feedback rather than escalating.
+        if "feature_request" in flags:
+            resp = self._compose(graph, prefix=(
+                "Thanks for the suggestion. I've logged this as a feature request "
+                "for the product team."), escalate=False)
+            return self._answer(resp + guard,
+                                self._area(passages, default="general_support"),
+                                "replied", "feature_request",
+                                "R5b feature_request: request for a new product "
+                                "capability; logged and acknowledged." + guard,
+                                confidence=0.7)
 
         # R6 — answerable from the knowledge base
         if cov.coverage_level in {"sufficient", "weak"}:
@@ -272,7 +299,7 @@ class ResolutionEngine:
             conf = 0.88 if cov.coverage_level == "sufficient" else 0.55
             return self._answer(resp + guard,
                                 self._area(passages, default="general_support"),
-                                "Replied", "product_issue",
+                                "replied", "product_issue",
                                 f"R6 grounded_answer: coverage={cov.coverage_level} "
                                 f"(top score {cov.top_score}); cited "
                                 f"{', '.join(cov.supporting_doc_ids) or 'none'}.{note}",
@@ -282,7 +309,7 @@ class ResolutionEngine:
         # R7 — no usable evidence -> escalate to a human
         return self._fixed(RESPONSE_ESCALATE,
                            self._area(passages, default="general_support"),
-                           "Escalated", "product_issue",
+                           "escalated", "product_issue",
                            "R7 no_evidence: no knowledge-base passage covers this "
                            "ticket; routed to a human agent." + guard,
                            confidence=0.5, manual_review=True)
@@ -398,7 +425,7 @@ class TicketPipeline:
             graph.disposition = self.resolve.decide(graph)
         except Exception as exc:  # failure isolation (TRD.md §6)
             graph.disposition = Disposition(
-                response=RESPONSE_ESCALATE, product_area="", status="Escalated",
+                response=RESPONSE_ESCALATE, product_area="", status="escalated",
                 request_type="bug",
                 justification=f"pipeline_error: {type(exc).__name__}: {exc}",
                 confidence=0.0, needs_manual_review=True,

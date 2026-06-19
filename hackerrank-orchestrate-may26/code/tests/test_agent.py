@@ -134,7 +134,7 @@ class TestPolicyAgent(unittest.TestCase):
 class TestResolutionRules(unittest.TestCase):
     def test_R1_pleasantry(self):
         d = disposition("none", "Thank you for helping me")
-        self.assertEqual((d.status, d.request_type), ("Replied", "invalid"))
+        self.assertEqual((d.status, d.request_type), ("replied", "invalid"))
         self.assertEqual(d.response, "Happy to help")
 
     def test_R2_out_of_scope_trivia(self):
@@ -148,26 +148,42 @@ class TestResolutionRules(unittest.TestCase):
 
     def test_R3_outage_is_bug_escalated(self):
         d = disposition("hackerrank", "none of the submissions are working on your website")
-        self.assertEqual((d.status, d.request_type), ("Escalated", "bug"))
+        self.assertEqual((d.status, d.request_type), ("escalated", "bug"))
 
     def test_R4_security_escalated(self):
         d = disposition("claude", "I have found a major security vulnerability, next steps?")
-        self.assertEqual(d.status, "Escalated")
+        self.assertEqual(d.status, "escalated")
         self.assertEqual(d.request_type, "product_issue")
 
     def test_R5_financial_escalated(self):
         d = disposition("hackerrank", "payment issue with order ID: cs_live_abcdefgh")
-        self.assertEqual(d.status, "Escalated")
+        self.assertEqual(d.status, "escalated")
 
     def test_R6_answerable_is_replied(self):
         d = disposition("hackerrank", "Hi, please pause our subscription.")
-        self.assertEqual((d.status, d.request_type), ("Replied", "product_issue"))
+        self.assertEqual((d.status, d.request_type), ("replied", "product_issue"))
         self.assertTrue(d.response.strip())
 
     def test_lost_card_is_answerable_not_escalated(self):
         # Reporting a lost/stolen card is a how-to (KB has the contacts), NOT R5.
         d = disposition("visa", "Where can I report a lost or stolen Visa card from India?")
-        self.assertEqual(d.status, "Replied")
+        self.assertEqual(d.status, "replied")
+
+    def test_R5b_feature_request(self):
+        d = disposition("claude", "Feature request: would be great if Claude could "
+                                   "export chats to PDF automatically.")
+        self.assertEqual((d.status, d.request_type), ("replied", "feature_request"))
+
+    def test_add_extra_time_is_not_feature_request(self):
+        # A user action ("add extra time") must not be misread as a feature req.
+        d = disposition("hackerrank", "How do I add extra time for a candidate on "
+                                       "their assessment?")
+        self.assertNotEqual(d.request_type, "feature_request")
+
+    def test_status_values_are_lowercase(self):
+        for d in (disposition("hackerrank", "How do I download my certificate?"),
+                  disposition("claude", "Claude has stopped working completely")):
+            self.assertIn(d.status, {"replied", "escalated"})
 
     def test_justification_cites_rule(self):
         d = disposition("hackerrank", "How do I download my certificate?")
@@ -199,7 +215,7 @@ class TestRobustness(unittest.TestCase):
 
     def test_blank_ticket_still_resolves(self):
         d = disposition("none", "", "")
-        self.assertIn(d.status, {"Replied", "Escalated"})
+        self.assertIn(d.status, {"replied", "escalated"})
         self.assertTrue(d.justification)
 
     def test_failure_isolation(self):
