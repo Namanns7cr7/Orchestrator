@@ -1,25 +1,34 @@
 """
 knowledge_base.py — loads the data/ help-doc corpus and provides deterministic
-TF-IDF retrieval. This is the "evidence source" of the system: retrieved
-passages are the support-ticket analog of the Vision Agent's VisualFacts.
+BM25 retrieval. Retrieved passages are the "evidence" of the system (the
+support-ticket analog of the Vision Agent's VisualFacts in the design docs).
 
-Pure standard library (no numpy / external vector DB) so the build is
-dependency-free, reproducible, and runs anywhere — a hackathon-appropriate
-choice per TRD.md §4 ("SQLite or plain files ... no hosted DB needed").
+Retrieval is BM25 (Okapi) over light-stemmed unigrams + bigrams, with a title
+boost. BM25 handles term saturation and document-length normalization far
+better than plain TF-IDF cosine for short keyword queries like support tickets.
+Scores are normalized to 0..1 (fraction of the per-query ideal) so the coverage
+thresholds in config.py are comparable across tickets.
+
+Pure standard library (no numpy / vector DB): dependency-free, deterministic,
+and reproducible — a hackathon-appropriate choice per TRD.md §4.
 """
 from __future__ import annotations
 
 import math
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
-from functools import lru_cache
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from config import KB_NAMESPACES
 
+# BM25 hyperparameters (Okapi defaults).
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+_TITLE_BOOST = 3          # title tokens are repeated this many times in the doc
+
 # Lightweight English stopword list — enough to stop common words dominating
-# TF-IDF without pulling in nltk.
+# retrieval without pulling in nltk.
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "for", "to", "of", "in",
     "on", "at", "by", "is", "are", "was", "were", "be", "been", "being", "do",
@@ -28,34 +37,61 @@ _STOPWORDS = {
     "as", "from", "how", "can", "please", "would", "could", "should", "will",
     "what", "when", "where", "which", "who", "why", "not", "no", "yes", "im",
     "am", "so", "there", "any", "out", "up", "about", "into", "than", "too",
+    "i'm", "i've", "we've", "want", "need", "get", "got", "use", "using", "help",
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
+def _stem(tok: str) -> str:
+    """Light, consistent suffix stripping so morphological variants align:
+    'submissions'->'submission', 'interviewers'->'interviewer', and crucially
+    'remove'/'removing'->'remov', 'challenge'/'challenges'->'challeng'.
+    Not a full Porter stemmer — conservative, but consistent between the base
+    form and its inflections (which is what matters for matching)."""
+    if len(tok) <= 3:
+        return tok
+    if tok.endswith("ings"):
+        tok = tok[:-4]
+    elif tok.endswith("ing") and len(tok) > 5:
+        tok = tok[:-3]
+    elif tok.endswith("ies") and len(tok) > 4:
+        tok = tok[:-3] + "y"
+    else:
+        for suf in ("es", "ed", "s"):
+            if tok.endswith(suf) and len(tok) - len(suf) >= 3 and not tok.endswith("ss"):
+                tok = tok[: -len(suf)]
+                break
+    # Collapse a trailing silent 'e' so base/gerund forms converge
+    # (remove -> remov, manage/managing -> manag).
+    if len(tok) > 4 and tok.endswith("e"):
+        tok = tok[:-1]
+    return tok
+
+
 def tokenize(text: str) -> list[str]:
-    """Lowercase, split on non-alphanumerics, drop stopwords and 1-char tokens."""
+    """Lowercase, split on non-alphanumerics, drop stopwords/1-char, light-stem."""
     return [
-        t for t in _TOKEN_RE.findall(text.lower())
+        _stem(t) for t in _TOKEN_RE.findall(text.lower())
         if len(t) > 1 and t not in _STOPWORDS
     ]
 
 
-def _parse_frontmatter_title(text: str) -> str | None:
-    """Extract `title:` from YAML frontmatter, if present."""
+def terms(tokens: list[str]) -> list[str]:
+    """Indexable terms. Currently light-stemmed unigrams; bigrams were tried and
+    removed (they added more noise than signal on this short-query corpus)."""
+    return list(tokens)
+
+
+# --------------------------------------------------------------------- parse #
+def _fm_field(text: str, name: str) -> str | None:
     if not text.startswith("---"):
         return None
     end = text.find("\n---", 3)
     if end == -1:
         return None
-    fm = text[3:end]
-    m = re.search(r'^title:\s*"?(.+?)"?\s*$', fm, re.MULTILINE)
+    m = re.search(rf'^{name}:\s*"?(.+?)"?\s*$', text[3:end], re.MULTILINE)
     return m.group(1).strip() if m else None
-
-
-def _parse_source_url(text: str) -> str:
-    m = re.search(r'^source_url:\s*"?(.+?)"?\s*$', text[:600], re.MULTILINE)
-    return m.group(1).strip() if m else ""
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -66,23 +102,35 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
+def _first_heading(text: str) -> str | None:
+    m = re.search(r"^#\s+(.+)$", _strip_frontmatter(text), re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def _slug_title(path: Path) -> str:
+    name = re.sub(r"^\d+-", "", path.stem)
+    return name.replace("-", " ").strip().capitalize()
+
+
 @dataclass
 class Document:
-    doc_id: str          # path relative to data/ (stable id)
-    namespace: str       # claude | hackerrank | visa
+    doc_id: str
+    namespace: str
     title: str
     url: str
     body: str
-    tokens: Counter      # term frequencies (body + title-weighted)
+    tf: Counter = field(default_factory=Counter)   # term -> frequency
+    length: int = 0                                 # total terms (for BM25)
 
 
 class KnowledgeBase:
-    """In-memory TF-IDF index over the help-doc corpus."""
+    """In-memory BM25 index over the help-doc corpus."""
 
     def __init__(self) -> None:
         self.docs: list[Document] = []
-        self.doc_freq: Counter = Counter()       # token -> #docs containing it
+        self.doc_freq: Counter = Counter()
         self._idf: dict[str, float] = {}
+        self._avgdl: float = 0.0
         self._by_namespace: dict[str, list[int]] = defaultdict(list)
         self._loaded = False
 
@@ -93,99 +141,76 @@ class KnowledgeBase:
         for namespace, root in KB_NAMESPACES.items():
             if not root.exists():
                 continue
+            corpus_root = root.parent  # data/
             for path in sorted(root.rglob("*.md")):
-                raw = path.read_text(encoding="utf-8", errors="ignore")
-                title = (
-                    _parse_frontmatter_title(raw)
-                    or _first_heading(raw)
-                    or _slug_title(path)
-                )
+                try:
+                    raw = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue  # e.g. Windows long-path; skip gracefully
+                title = _fm_field(raw, "title") or _first_heading(raw) or _slug_title(path)
                 body = _strip_frontmatter(raw)
-                # Title terms count extra — they're the strongest topic signal.
-                tf = Counter(tokenize(body) + tokenize(title) * 3)
+                toks = tokenize(body) + tokenize(title) * _TITLE_BOOST
+                tf = Counter(terms(toks))
                 if not tf:
                     continue
                 idx = len(self.docs)
-                self.docs.append(
-                    Document(
-                        doc_id=str(path.relative_to(KB_NAMESPACES[namespace].parent.parent)),
-                        namespace=namespace,
-                        title=title,
-                        url=_parse_source_url(raw),
-                        body=body.strip(),
-                        tokens=tf,
-                    )
-                )
+                self.docs.append(Document(
+                    doc_id=str(path.relative_to(corpus_root)),
+                    namespace=namespace,
+                    title=title,
+                    url=_fm_field(raw, "source_url") or "",
+                    body=body.strip(),
+                    tf=tf,
+                    length=sum(tf.values()),
+                ))
                 self._by_namespace[namespace].append(idx)
                 for term in tf:
                     self.doc_freq[term] += 1
 
         n = max(1, len(self.docs))
+        # BM25 idf (always positive form).
         self._idf = {
-            term: math.log((n + 1) / (df + 1)) + 1.0
+            term: math.log(1 + (n - df + 0.5) / (df + 0.5))
             for term, df in self.doc_freq.items()
         }
+        self._avgdl = (sum(d.length for d in self.docs) / n) or 1.0
         self._loaded = True
         return self
 
     # ------------------------------------------------------------- retrieve #
-    def _doc_vector_norm(self, doc: Document) -> float:
-        return math.sqrt(
-            sum((tf * self._idf.get(t, 0.0)) ** 2 for t, tf in doc.tokens.items())
-        ) or 1.0
-
-    @lru_cache(maxsize=2048)
-    def _norm_cached(self, idx: int) -> float:
-        return self._doc_vector_norm(self.docs[idx])
-
     def search(
         self, query: str, namespace: str | None = None, top_k: int = 5
     ) -> list[tuple[Document, float]]:
-        """Return up to `top_k` (Document, cosine_score) pairs, score in 0..1.
-
-        If `namespace` is given and known, search only that namespace; otherwise
-        search the whole corpus. Deterministic: ties broken by doc_id.
-        """
-        q_tokens = tokenize(query)
-        if not q_tokens:
+        """Return up to `top_k` (Document, score) pairs, score normalized to
+        0..1. If `namespace` is known, restrict to it; else search the corpus.
+        Deterministic: ties broken by doc_id."""
+        q_terms = list(dict.fromkeys(terms(tokenize(query))))  # distinct, ordered
+        q_terms = [t for t in q_terms if t in self._idf]
+        if not q_terms:
             return []
-        q_tf = Counter(q_tokens)
-        q_weights = {t: tf * self._idf.get(t, 0.0) for t, tf in q_tf.items()}
-        q_norm = math.sqrt(sum(w * w for w in q_weights.values())) or 1.0
+        # Per-query ideal (tf->inf, len->0) used to normalize into 0..1.
+        ideal = sum(self._idf[t] * (_BM25_K1 + 1) for t in q_terms) or 1.0
 
-        candidate_idxs = (
+        candidates = (
             self._by_namespace.get(namespace)
             if namespace in self._by_namespace
             else range(len(self.docs))
         )
 
         scored: list[tuple[float, str, int]] = []
-        for idx in candidate_idxs:
+        for idx in candidates:
             doc = self.docs[idx]
-            dot = 0.0
-            for t, qw in q_weights.items():
-                tf = doc.tokens.get(t)
-                if tf:
-                    dot += qw * tf * self._idf.get(t, 0.0)
-            if dot <= 0:
-                continue
-            cos = dot / (q_norm * self._norm_cached(idx))
-            scored.append((cos, doc.doc_id, idx))
+            s = 0.0
+            denom_len = _BM25_K1 * (1 - _BM25_B + _BM25_B * doc.length / self._avgdl)
+            for t in q_terms:
+                f = doc.tf.get(t)
+                if f:
+                    s += self._idf[t] * (f * (_BM25_K1 + 1)) / (f + denom_len)
+            if s > 0:
+                scored.append((s / ideal, doc.doc_id, idx))
 
-        # sort by score desc, then doc_id asc for stable/deterministic ordering
         scored.sort(key=lambda x: (-x[0], x[1]))
-        return [(self.docs[idx], score) for score, _, idx in scored[:top_k]]
-
-
-def _first_heading(text: str) -> str | None:
-    m = re.search(r"^#\s+(.+)$", _strip_frontmatter(text), re.MULTILINE)
-    return m.group(1).strip() if m else None
-
-
-def _slug_title(path: Path) -> str:
-    name = path.stem
-    name = re.sub(r"^\d+-", "", name)          # drop leading article-id
-    return name.replace("-", " ").strip().capitalize()
+        return [(self.docs[idx], round(score, 4)) for score, _, idx in scored[:top_k]]
 
 
 def best_snippet(doc: Document, query: str, max_chars: int = 320) -> str:
@@ -202,5 +227,4 @@ def best_snippet(doc: Document, query: str, max_chars: int = 320) -> str:
         overlap = len(q & set(tokenize(p)))
         if overlap > best_overlap:
             best, best_overlap = p, overlap
-    snippet = re.sub(r"\s+", " ", best).strip()
-    return snippet[:max_chars]
+    return re.sub(r"\s+", " ", best).strip()[:max_chars]

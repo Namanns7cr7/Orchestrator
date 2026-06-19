@@ -25,8 +25,9 @@ the same `status`/`request_type` — verified reproducible across runs.
 
 ```bash
 # from the repo root (hackerrank-orchestrate-may26/)
-python code/main.py                 # -> support_tickets/output.csv
-python code/evaluate.py             # accuracy vs the labeled sample set
+python code/main.py                              # -> support_tickets/output.csv
+python code/evaluate.py                           # accuracy vs labeled sample set
+python -m unittest discover -s code/tests -v      # full test suite (30 tests)
 ```
 
 No dependencies are required to run offline. To enable Claude-written responses:
@@ -49,7 +50,8 @@ TicketUnderstanding -> Retrieval -> Policy -> EvidenceMatching -> Resolution -> 
 ```
 
 1. **TicketUnderstandingAgent** — normalizes the ticket, detects language.
-2. **RetrievalAgent** — TF-IDF search over `data/{company}/`, top-k passages.
+2. **RetrievalAgent** — BM25 search (light-stemmed, length-normalized) over
+   `data/{company}/`, top-k passages.
 3. **PolicyAgent** — flags out-of-scope, pleasantries, outages, prompt-injection,
    security reports, financial/identity actions (never answers the ticket).
 4. **EvidenceMatchingAgent** — rule-based coverage level (`sufficient`/`weak`/`none`).
@@ -89,6 +91,26 @@ audit table from `DATABASE_SCHEMA.md`).
 columns in `sample_support_tickets.csv` and prints a confusion matrix
 (Decision Accuracy from `EVALUATION_AND_EXPERIMENTS.md`). Current labeled-set
 result: **100% status, 100% request_type** (10 labeled tickets).
+
+### Tests
+
+`code/tests/test_agent.py` is a 30-test `unittest` suite (no external deps):
+retrieval determinism + relevance, every policy flag, all decision rules
+(R1–R7), prompt-injection neutralization, determinism, failure isolation,
+output schema, a **no-hardcoding guard** (asserts the decision code contains no
+dataset ids), and an end-to-end accuracy gate (≥ 80% on the labeled set).
+
+```bash
+python -m unittest discover -s code/tests -v
+```
+
+## Retrieval
+
+BM25 (Okapi, `k1=1.5`, `b=0.75`) over light-stemmed unigrams with a title
+boost, scores normalized to `0..1` (fraction of the per-query ideal) so the
+coverage thresholds are comparable across tickets. Chosen over plain TF-IDF
+cosine because it handles term saturation and document length far better on
+short keyword queries. Pure standard library — deterministic and dependency-free.
 
 ## Design choices
 

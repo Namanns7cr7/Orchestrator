@@ -53,11 +53,12 @@ OUTPUT_COLUMNS = [
 # Evidence Coverage Score in SYSTEM_DESIGN.md §3).
 # --------------------------------------------------------------------------- #
 RETRIEVAL_TOP_K = 5          # passages pulled into the Evidence Graph per ticket
-# A normalized top-passage score >= this means retrieval is "sufficient" to
-# answer from the knowledge base (analogous to ECS >= 0.8 -> SUPPORTED).
-EVIDENCE_SUFFICIENT_SCORE = 0.18
-# Below this, coverage is too weak to ground an answer -> escalate / best-effort.
-EVIDENCE_WEAK_SCORE = 0.06
+# Normalized BM25 top-passage score >= this means retrieval is "sufficient" to
+# answer confidently from the knowledge base (analogous to ECS >= 0.8).
+# Calibrated against the labeled sample-set score distribution.
+EVIDENCE_SUFFICIENT_SCORE = 0.20
+# Below this, coverage is too weak to ground an answer at all -> escalate.
+EVIDENCE_WEAK_SCORE = 0.08
 
 # --------------------------------------------------------------------------- #
 # LLM configuration. The pipeline is fully deterministic and runs OFFLINE with

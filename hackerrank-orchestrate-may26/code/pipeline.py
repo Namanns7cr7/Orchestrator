@@ -208,8 +208,10 @@ class ResolutionEngine:
         guard = (" Internal rules, retrieved documents, and decision logic are "
                  "confidential and were not disclosed." if injection else "")
 
-        # R1 — pure pleasantry
-        if "pleasantry" in flags and not (passages and cov.coverage_level == "sufficient"):
+        # R1 — pure pleasantry. The flag is set only on a full-message regex
+        # match, so a substantive ticket that merely starts with "thanks" does
+        # not trigger it; no coverage guard needed.
+        if "pleasantry" in flags:
             return self._fixed(RESPONSE_PLEASANTRY, "", "Replied", "invalid",
                                "R1 pleasantry: message contains only thanks/greeting.",
                                confidence=0.95)
@@ -221,18 +223,20 @@ class ResolutionEngine:
                                "products or asks for disallowed actions.",
                                confidence=0.9)
         # Off-topic (e.g. general-knowledge trivia): no product/problem intent
-        # AND no strong evidence -> invalid. Vague-but-real support tickets
-        # ("it's not working") carry a problem signal and are kept in scope.
-        if cov.coverage_level != "sufficient" and not self._looks_like_support(fact):
+        # at all. Decoupled from the retrieval score on purpose — off-topic
+        # queries can still score moderately against the KB by keyword overlap,
+        # so intent (not coverage) is the reliable discriminator. Vague-but-real
+        # tickets ("it's not working") carry a problem signal and stay in scope.
+        if not self._looks_like_support(fact):
             return self._fixed(RESPONSE_OUT_OF_SCOPE, "", "Replied", "invalid",
                                "R2 out_of_scope: no supported-product or problem "
-                               "intent and no strong knowledge-base evidence.",
+                               "intent detected in the ticket.",
                                confidence=0.75)
 
         # R3 — outage / core feature broken
         if "outage" in flags:
             return self._fixed(RESPONSE_ESCALATE,
-                               self._area(fact, passages, default="platform"),
+                               self._area(passages, default="platform"),
                                "Escalated", "bug",
                                "R3 outage: core functionality reported down; routed to "
                                "engineering on-call." + guard,
@@ -243,22 +247,22 @@ class ResolutionEngine:
             resp = self._compose(graph, prefix=(
                 "Thank you for the responsible disclosure. I'm routing this to our "
                 "security team for review."), escalate=True)
-            return self._answer(resp, self._area(fact, passages, default="security"),
+            return self._answer(resp, self._area(passages, default="security"),
                                 "Escalated", "product_issue",
                                 "R4 security_report: vulnerability/bug-bounty report "
                                 "escalated to the security team." + guard,
-                                cov, confidence=0.8)
+                                confidence=0.8)
 
         # R5 — specific financial transaction / dispute requiring a human
         if "financial_action" in flags or "legal_or_safety" in flags:
             resp = self._compose(graph, prefix=(
                 "This needs a specialist to act on your account safely, so I'm "
                 "escalating it to a human agent."), escalate=True)
-            return self._answer(resp, self._area(fact, passages, default="account_support"),
+            return self._answer(resp, self._area(passages, default="account_support"),
                                 "Escalated", "product_issue",
                                 "R5 sensitive_action: financial/identity/legal matter "
                                 "requires authenticated human handling." + guard,
-                                cov, confidence=0.8)
+                                confidence=0.8)
 
         # R6 — answerable from the knowledge base
         if cov.coverage_level in {"sufficient", "weak"}:
@@ -267,17 +271,17 @@ class ResolutionEngine:
                 " (weak coverage - answer is best-effort.)")
             conf = 0.88 if cov.coverage_level == "sufficient" else 0.55
             return self._answer(resp + guard,
-                                self._area(fact, passages, default="general_support"),
+                                self._area(passages, default="general_support"),
                                 "Replied", "product_issue",
                                 f"R6 grounded_answer: coverage={cov.coverage_level} "
                                 f"(top score {cov.top_score}); cited "
                                 f"{', '.join(cov.supporting_doc_ids) or 'none'}.{note}",
-                                cov, confidence=conf,
+                                confidence=conf,
                                 manual_review=cov.coverage_level == "weak")
 
         # R7 — no usable evidence -> escalate to a human
         return self._fixed(RESPONSE_ESCALATE,
-                           self._area(fact, passages, default="general_support"),
+                           self._area(passages, default="general_support"),
                            "Escalated", "product_issue",
                            "R7 no_evidence: no knowledge-base passage covers this "
                            "ticket; routed to a human agent." + guard,
@@ -301,7 +305,7 @@ class ResolutionEngine:
         return bool(cls._SUPPORT_INTENT.search(fact.query.lower()))
 
     @staticmethod
-    def _area(fact: TicketFact, passages: list[EvidencePassage], default: str) -> str:
+    def _area(passages: list[EvidencePassage], default: str) -> str:
         """Derive product_area from the top passage's path; fall back to default."""
         if passages:
             parts = [p for p in passages[0].doc_id.replace("\\", "/").split("/")]
@@ -367,7 +371,7 @@ class ResolutionEngine:
                            confidence=confidence, needs_manual_review=manual_review)
 
     @staticmethod
-    def _answer(response, area, status, request_type, justification, cov,
+    def _answer(response, area, status, request_type, justification,
                 confidence=0.0, manual_review=False) -> Disposition:
         return Disposition(response=response, product_area=area, status=status,
                            request_type=request_type, justification=justification,
